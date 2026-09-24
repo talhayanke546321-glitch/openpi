@@ -997,7 +997,10 @@ _CONFIGS = [
         data=LeRobotGalaxeaDataConfig(
             repo_id="galaxea_r1_multi_asset_v1",
             assets=AssetsConfig(
-                assets_dir="/home/vipuser/robotics/openpi/assets/pi05_galaxea_r1_multitask"
+                assets_dir=os.environ.get(
+                    "OPENPI_MULTITASK_ASSETS_DIR",
+                    "/home/vipuser/robotics/openpi/assets/pi05_galaxea_r1_multitask",
+                )
             ),
             dataset_root=os.environ.get(
                 "GALAXEA_MULTITASK_LEROBOT_ROOT",
@@ -1060,7 +1063,10 @@ _CONFIGS = [
         data=LeRobotGalaxeaDataConfig(
             repo_id="galaxea_r1_upright_bottles_v1",
             assets=AssetsConfig(
-                assets_dir="/home/vipuser/robotics/openpi/assets/pi05_galaxea_r1_upright_bottles_v1"
+                assets_dir=os.environ.get(
+                    "OPENPI_UPRIGHT_BOTTLES_ASSETS_DIR",
+                    "/home/vipuser/robotics/openpi/assets/pi05_galaxea_r1_upright_bottles_v1",
+                )
             ),
             dataset_root=os.environ.get(
                 "GALAXEA_UPRIGHT_BOTTLES_LEROBOT_ROOT",
