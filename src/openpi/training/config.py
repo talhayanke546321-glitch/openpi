@@ -1,10 +1,17 @@
-"""See _CONFIGS for the list of available configs."""
+"""OpenPI 训练/推理配置定义。
+
+``_CONFIGS`` 是命令行配置名到模型、数据集、transform、stats 和训练
+超参数的映射。Galaxea 部分的配置不仅决定训练用哪个 checkpoint，还
+定义了在线服务端必须复用的同一套输入/输出语义。
+"""
 
 import abc
 from collections.abc import Sequence
 import dataclasses
 import difflib
+import json
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -19,6 +26,8 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.galaxea_policy as galaxea_policy
+import openpi.policies.galaxea_r1_pro_policy as galaxea_r1_pro_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -63,6 +72,15 @@ class AssetsConfig:
 
 @dataclasses.dataclass(frozen=True)
 class DataConfig:
+    """已经解析完成、可以交给 data loader 的数据配置。
+
+    对 Galaxea 来说，``repo_id``/``dataset_root`` 指向 LeRobot 数据，
+    ``repack_transforms`` 负责把分字段样本拼回 R1 接口，
+    ``data_transforms`` 负责夹爪和 delta action，``model_transforms``
+    负责 π0.5 的图片/文本处理。最后三组 transform 会在推理时以相同
+    顺序复用。
+    """
+
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
     # Directory within the assets directory containing the data assets.
@@ -96,6 +114,27 @@ class DataConfig:
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+
+    # Galaxea 生成的本地 LeRobot 数据集根目录。None 时使用 LeRobot 默认
+    # cache/Hub；仿真项目通常通过环境变量显式传入这个路径。
+    # This is useful for datasets generated directly by GalaxeaManipSim.
+    dataset_root: str | pathlib.Path | None = None
+    # normalization stats 的来源契约。它必须单独保存，因为 stats 数值本身
+    # 不记录 action horizon 和 transform 顺序。
+    # Expected provenance contract for the normalization stats. This is kept
+    # separate from ``norm_stats`` because the JSON stats file itself does not
+    # encode the action horizon or transform order.
+    norm_stats_metadata: dict[str, Any] | None = None
+    # Whether the expected stats provenance sidecar was found in the configured
+    # assets directory. Training checks this before applying normalization.
+    norm_stats_metadata_present: bool = False
+    # If true, training/inference must use stats generated with the current
+    # Galaxea contract. Generic configs leave this false.
+    require_norm_stats_metadata: bool = False
+    # Expected provenance fields in the LeRobot ``meta/info.json`` file.
+    dataset_metadata: dict[str, Any] | None = None
+    # If true, the data loader must find and validate the dataset contract.
+    require_dataset_metadata: bool = False
 
 
 class GroupFactory(Protocol):
@@ -165,6 +204,8 @@ class ModelTransformFactory(GroupFactory):
 
 @dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
+    """把简洁的训练配置工厂展开成完整 ``DataConfig``。"""
+
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
     # Determines how the assets will be loaded.
@@ -177,6 +218,7 @@ class DataConfigFactory(abc.ABC):
         """Create a data config."""
 
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        """解析 repo/asset/stats 路径，并创建通用基础数据配置。"""
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
         return dataclasses.replace(
@@ -188,6 +230,7 @@ class DataConfigFactory(abc.ABC):
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
+        """加载标准 normalization stats；找不到时返回 None 供上层报错。"""
         if asset_id is None:
             return None
         try:
@@ -198,6 +241,24 @@ class DataConfigFactory(abc.ABC):
         except FileNotFoundError:
             logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
         return None
+
+    def _load_norm_stats_metadata(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, Any] | None:
+        """读取 ``norm_stats.json`` 旁边描述来源契约的 JSON sidecar。"""
+
+        if asset_id is None:
+            return None
+        metadata_url = str(assets_dir / asset_id / galaxea_policy.NORM_STATS_METADATA_FILENAME)
+        try:
+            metadata_path = _download.maybe_download(metadata_url)
+            metadata = json.loads(metadata_path.read_text())
+        except FileNotFoundError:
+            logging.info(f"Norm stats metadata not found at {metadata_url}, skipping.")
+            return None
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Invalid normalization-stat metadata JSON at {metadata_url}") from error
+        if not isinstance(metadata, dict):
+            raise ValueError(f"Normalization-stat metadata at {metadata_url} must be a JSON object")
+        return metadata
 
 
 @dataclasses.dataclass(frozen=True)
@@ -276,6 +337,244 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotGalaxeaDataConfig(DataConfigFactory):
+    """标准 Galaxea R1 的 LeRobot 数据配置。
+
+    LeRobot data configuration for the standard Galaxea R1.
+
+    The Galaxea converter stores arm and gripper values in separate feature
+    fields. ``GalaxeaLeRobotRepack`` combines them into the 14-dimensional
+    interface consumed by ``GalaxeaInputs``. The same robot-specific
+    transforms are then used by training and online inference.
+    """
+
+    # A local root can be supplied for datasets produced by GalaxeaManipSim.
+    # When omitted, LeRobot resolves ``repo_id`` using its normal cache/Hub
+    # behavior.
+    dataset_root: str | pathlib.Path | None = None
+    # Convert absolute joint targets to deltas. Gripper dimensions stay absolute.
+    use_delta_joint_actions: bool = True
+    # Real Galaxea training must have a provenance sidecar. The shape-only
+    # smoke config below deliberately disables this because it uses built-in
+    # UR5e statistics rather than statistics computed from R1 data.
+    require_stats_metadata: bool = True
+    # The stats command sets this false so it can replace an obsolete sidecar
+    # while recomputing statistics for a changed action horizon.
+    validate_stats_metadata: bool = True
+    default_prompt: str | None = None
+    repack_transforms: _transforms.Group = dataclasses.field(
+        default_factory=lambda: _transforms.Group(
+            inputs=[galaxea_policy.GalaxeaLeRobotRepack()]
+        )
+    )
+    action_sequence_keys: Sequence[str] = galaxea_policy.GalaxeaLeRobotRepack.action_fields
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        """构造 R1 专用数据流，并强制检查 15 步/32 维模型契约。"""
+        if model_config.action_horizon != galaxea_policy.GALAXEA_ACTION_HORIZON:
+            raise ValueError(
+                "Galaxea R1 requires model action_horizon="
+                f"{galaxea_policy.GALAXEA_ACTION_HORIZON}, got {model_config.action_horizon}"
+            )
+        if model_config.action_dim != galaxea_policy.GALAXEA_MODEL_ACTION_DIM:
+            raise ValueError(
+                "Galaxea R1/π0.5 requires internal model action_dim="
+                f"{galaxea_policy.GALAXEA_MODEL_ACTION_DIM}, got {model_config.action_dim}"
+            )
+        # 先把仿真/LeRobot 字段转换成 Galaxea 14 维语义，再按配置选择是否
+        # 将 12 个手臂关节变成 delta action；夹爪始终保持绝对值。
+        data_transforms = _transforms.Group(
+            inputs=[galaxea_policy.GalaxeaInputs()],
+            outputs=[galaxea_policy.GalaxeaOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = galaxea_policy.make_delta_action_mask()
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        # 这里的 model_transforms 会在 normalization 之后处理 224x224 图像、
+        # prompt tokenization 和 32 维 padding，训练和在线推理共用。
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        base_config = self.create_base_config(assets_dirs, model_config)
+        stats_metadata = None
+        stats_metadata_present = False
+        if self.require_stats_metadata:
+            stats_metadata = galaxea_policy.make_norm_stats_metadata(
+                action_horizon=model_config.action_horizon,
+                use_delta_joint_actions=self.use_delta_joint_actions,
+            )
+            actual_metadata = self._load_norm_stats_metadata(
+                epath.Path(self.assets.assets_dir or assets_dirs),
+                base_config.asset_id,
+            )
+            stats_metadata_present = actual_metadata is not None
+            if actual_metadata is not None and self.validate_stats_metadata:
+                galaxea_policy.validate_norm_stats_metadata(actual_metadata, stats_metadata)
+
+        # 把契约元数据放入 DataConfig，供 data loader、stats 计算和 checkpoint
+        # 加载阶段反复校验，避免“形状兼容但物理语义错误”的数据混用。
+        return dataclasses.replace(
+            base_config,
+            dataset_root=self.dataset_root if self.dataset_root is not None else base_config.dataset_root,
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            norm_stats_metadata=stats_metadata,
+            norm_stats_metadata_present=stats_metadata_present,
+            require_norm_stats_metadata=self.require_stats_metadata,
+            dataset_metadata=galaxea_policy.make_dataset_metadata(),
+            require_dataset_metadata=self.require_stats_metadata,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotGalaxeaR1ProDataConfig(DataConfigFactory):
+    """R1 Pro 7 轴双臂 LeRobot 数据和在线推理配置。
+
+    GalaxeaManipSim 的通用转换器把 R1 Pro 保存成三个 ``rgb_*`` 图像、一个
+    16 维 ``observation.state`` 和一个 16 维 ``action``。本配置先把这些
+    字段重排成在线接口，再执行夹爪语义转换、关节 delta action、归一化和
+    π0.5 的 32 维 padding。训练与在线推理因此共享同一条变换链。
+    """
+
+    dataset_root: str | pathlib.Path | None = None
+    use_delta_joint_actions: bool = True
+    require_stats_metadata: bool = True
+    validate_stats_metadata: bool = True
+    default_prompt: str | None = None
+    repack_transforms: _transforms.Group = dataclasses.field(
+        default_factory=lambda: _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.rgb_head",
+                            "cam_left_wrist": "observation.images.rgb_left_hand",
+                            "cam_right_wrist": "observation.images.rgb_right_hand",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        """创建严格的 15 步、16 维物理接口和 32 维模型接口。"""
+        if model_config.action_horizon != galaxea_r1_pro_policy.R1_PRO_ACTION_HORIZON:
+            raise ValueError(
+                "Galaxea R1 Pro requires model action_horizon="
+                f"{galaxea_r1_pro_policy.R1_PRO_ACTION_HORIZON}, got {model_config.action_horizon}"
+            )
+        if model_config.action_dim != galaxea_r1_pro_policy.R1_PRO_MODEL_ACTION_DIM:
+            raise ValueError(
+                "Galaxea R1 Pro/π0.5 requires internal model action_dim="
+                f"{galaxea_r1_pro_policy.R1_PRO_MODEL_ACTION_DIM}, got {model_config.action_dim}"
+            )
+
+        data_transforms = _transforms.Group(
+            inputs=[galaxea_r1_pro_policy.GalaxeaR1ProInputs()],
+            outputs=[galaxea_r1_pro_policy.GalaxeaR1ProOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            delta_mask = galaxea_r1_pro_policy.make_delta_action_mask()
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        base_config = self.create_base_config(assets_dirs, model_config)
+        stats_metadata = None
+        stats_metadata_present = False
+        if self.require_stats_metadata:
+            stats_metadata = galaxea_r1_pro_policy.make_norm_stats_metadata(
+                action_horizon=model_config.action_horizon,
+                use_delta_joint_actions=self.use_delta_joint_actions,
+            )
+            actual_metadata = self._load_norm_stats_metadata(
+                epath.Path(self.assets.assets_dir or assets_dirs),
+                base_config.asset_id,
+            )
+            stats_metadata_present = actual_metadata is not None
+            if actual_metadata is not None and self.validate_stats_metadata:
+                galaxea_r1_pro_policy.validate_norm_stats_metadata(actual_metadata, stats_metadata)
+
+        return dataclasses.replace(
+            base_config,
+            dataset_root=self.dataset_root if self.dataset_root is not None else base_config.dataset_root,
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            norm_stats_metadata=stats_metadata,
+            norm_stats_metadata_present=stats_metadata_present,
+            require_norm_stats_metadata=self.require_stats_metadata,
+            dataset_metadata=galaxea_r1_pro_policy.make_dataset_metadata(),
+            require_dataset_metadata=self.require_stats_metadata,
+        )
+
+
+GALAXEA_R1_PRO_POLICY_METADATA = {
+    "protocol_version": "galaxea-r1-pro-openpi-v1",
+    "robot": "r1_pro",
+    "controller": "bimanual_joint_position",
+    "action_dim": galaxea_r1_pro_policy.R1_PRO_STATE_DIM,
+    "action_horizon": galaxea_r1_pro_policy.R1_PRO_ACTION_HORIZON,
+    "execute_horizon": galaxea_r1_pro_policy.R1_PRO_EXECUTE_HORIZON,
+    "control_frequency_hz": 15,
+    "state_order": list(galaxea_r1_pro_policy.R1_PRO_STATE_ORDER),
+    "action_order": list(galaxea_r1_pro_policy.R1_PRO_STATE_ORDER),
+    "arm_position_unit": "radian",
+    "gripper_canonical_closed": 0.0,
+    "gripper_canonical_open": galaxea_r1_pro_policy.R1_PRO_GRIPPER_MAX,
+    "image_keys": list(galaxea_r1_pro_policy.R1_PRO_IMAGE_NAMES),
+    "image_layout": "HWC",
+    "image_dtype": "uint8",
+    "image_color_space": "RGB",
+    "training_domain": "simulation",
+    "real_robot_validated": False,
+}
+
+
+GALAXEA_POLICY_METADATA = {
+    # 这些字段会随 WebSocket 握手发送给仿真/真机客户端；它们不是模型输入，
+    # 而是客户端用来确认机器人、关节顺序、单位和动作块协议的边界契约。
+    "protocol_version": "galaxea-r1-openpi-v1",
+    "robot": "r1",
+    "controller": "bimanual_joint_position",
+    "action_dim": galaxea_policy.GALAXEA_STATE_DIM,
+    "action_horizon": galaxea_policy.GALAXEA_ACTION_HORIZON,
+    "execute_horizon": galaxea_policy.GALAXEA_EXECUTE_HORIZON,
+    "control_frequency_hz": 15,
+    "state_order": list(galaxea_policy.GALAXEA_STATE_ORDER),
+    "action_order": list(galaxea_policy.GALAXEA_STATE_ORDER),
+    "arm_position_unit": "radian",
+    # 这是模型/仿真兼容的夹爪规范值，不是 R1 SDK 的 0~100 硬件行程。
+    # 真机客户端必须在 ROS 边界完成比例映射。
+    "gripper_canonical_closed": 0.0,
+    "gripper_canonical_open": galaxea_policy.GALAXEA_GRIPPER_MAX,
+    "hardware_gripper_mapping_required": True,
+    "image_keys": list(galaxea_policy.GALAXEA_IMAGE_NAMES),
+    "image_layout": "HWC",
+    "image_dtype": "uint8",
+    "image_color_space": "RGB",
+    # 当前 checkpoint 由仿真数据训练，metadata 明确禁止把“协议兼容”误解为
+    # “已通过真机效果/安全验证”。将来使用真机数据训练后应发布新协议元数据。
+    "training_domain": "simulation",
+    "real_robot_validated": False,
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -576,6 +875,238 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="trossen"),
         ),
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
+    ),
+    # R1 Pro 单任务配置。它从 pi05_base 初始化，但必须先用 R1 Pro 16 维
+    # 数据计算独立的 norm stats，随后完成微调；不能把 base 权重裸输出到
+    # 仿真器。GALAXEA_R1PRO_LEROBOT_ROOT 应指向通用 Galaxea 转换器生成的
+    # LeRobot 数据集根目录。
+    TrainConfig(
+        name="pi05_galaxea_r1_pro",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_r1_pro_policy.R1_PRO_MODEL_ACTION_DIM,
+            action_horizon=galaxea_r1_pro_policy.R1_PRO_ACTION_HORIZON,
+        ),
+        data=LeRobotGalaxeaR1ProDataConfig(
+            repo_id="R1ProDualBottlesPickEasy-v0",
+            dataset_root=os.environ.get("GALAXEA_R1PRO_LEROBOT_ROOT"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get(
+                "OPENPI_PI05_BASE_PARAMS",
+                "gs://openpi-assets/checkpoints/pi05_base/params",
+            )
+        ),
+        num_train_steps=30_000,
+        policy_metadata=GALAXEA_R1_PRO_POLICY_METADATA,
+    ),
+    # 低显存 R1 Pro LoRA 配置，与当前 RTX 3080 工作流保持一致。归一化
+    # 统计会写入独立 assets 目录，不能与14维标准 R1 共用。
+    TrainConfig(
+        name="pi05_galaxea_r1_pro_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_r1_pro_policy.R1_PRO_MODEL_ACTION_DIM,
+            action_horizon=galaxea_r1_pro_policy.R1_PRO_ACTION_HORIZON,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotGalaxeaR1ProDataConfig(
+            repo_id="R1ProDualBottlesPickEasy-v0",
+            assets=AssetsConfig(
+                assets_dir=os.environ.get(
+                    "OPENPI_R1PRO_ASSETS_DIR",
+                    "/home/vipuser/robotics/openpi/assets/pi05_galaxea_r1_pro",
+                )
+            ),
+            dataset_root=os.environ.get("GALAXEA_R1PRO_LEROBOT_ROOT"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get(
+                "OPENPI_PI05_BASE_PARAMS",
+                "/home/vipuser/robotics/openpi-data/openpi-assets/checkpoints/pi05_base/params",
+            )
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_r1_pro_policy.R1_PRO_MODEL_ACTION_DIM,
+            action_horizon=galaxea_r1_pro_policy.R1_PRO_ACTION_HORIZON,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=30_000,
+        policy_metadata=GALAXEA_R1_PRO_POLICY_METADATA,
+    ),
+    # 单任务 R1 配置：适合只使用一个 Gym 任务数据集进行微调。
+    TrainConfig(
+        name="pi05_galaxea_r1",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_policy.GALAXEA_MODEL_ACTION_DIM,
+            action_horizon=galaxea_policy.GALAXEA_ACTION_HORIZON,
+        ),
+        data=LeRobotGalaxeaDataConfig(
+            repo_id="R1DualBottlesPickEasy-v0",
+            dataset_root=os.environ.get("GALAXEA_LEROBOT_ROOT"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        policy_metadata=GALAXEA_POLICY_METADATA,
+    ),
+    # 多任务配置：每个 episode 的 language_instruction 写入 LeRobot task，
+    # prompt_from_task=True 让训练时使用与在线仿真相同的自然语言条件。
+    TrainConfig(
+        name="pi05_galaxea_r1_multitask",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_policy.GALAXEA_MODEL_ACTION_DIM,
+            action_horizon=galaxea_policy.GALAXEA_ACTION_HORIZON,
+        ),
+        data=LeRobotGalaxeaDataConfig(
+            repo_id="galaxea_r1_multi_asset_v1",
+            dataset_root=os.environ.get(
+                "GALAXEA_MULTITASK_LEROBOT_ROOT",
+                "/home/vipuser/robotics/GalaxeaManipSim/datasets/galaxea_r1_multi_asset_v1/lerobot",
+            ),
+            # The merged converter stores each episode's natural-language
+            # instruction in LeRobot's task field.
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        policy_metadata=GALAXEA_POLICY_METADATA,
+    ),
+    # 重新构建的多资产 R1 数据集的 LoRA 配置（8 个任务 x 50 条 episode）。
+    # LoRA variant for the rebuilt multi-asset R1 dataset (8 tasks x 50
+    # episodes).  Its stats are generated from the same 15-step action
+    # horizon and Galaxea recording contract as the training data.
+    TrainConfig(
+        name="pi05_galaxea_r1_multitask_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_policy.GALAXEA_MODEL_ACTION_DIM,
+            action_horizon=galaxea_policy.GALAXEA_ACTION_HORIZON,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotGalaxeaDataConfig(
+            repo_id="galaxea_r1_multi_asset_v1",
+            assets=AssetsConfig(
+                assets_dir="/home/vipuser/robotics/openpi/assets/pi05_galaxea_r1_multitask"
+            ),
+            dataset_root=os.environ.get(
+                "GALAXEA_MULTITASK_LEROBOT_ROOT",
+                "/home/vipuser/robotics/GalaxeaManipSim/datasets/galaxea_r1_multi_asset_v1/lerobot",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get(
+                "OPENPI_PI05_BASE_PARAMS",
+                "/home/vipuser/robotics/openpi-data/openpi-assets/checkpoints/pi05_base/params",
+            )
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_policy.GALAXEA_MODEL_ACTION_DIM,
+            action_horizon=galaxea_policy.GALAXEA_ACTION_HORIZON,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=10_000,
+        policy_metadata=GALAXEA_POLICY_METADATA,
+    ),
+    # 单独的 upright bottles 数据配置。
+    TrainConfig(
+        name="pi05_galaxea_r1_upright_bottles_v1",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_policy.GALAXEA_MODEL_ACTION_DIM,
+            action_horizon=galaxea_policy.GALAXEA_ACTION_HORIZON,
+        ),
+        data=LeRobotGalaxeaDataConfig(
+            repo_id="galaxea_r1_upright_bottles_v1",
+            dataset_root=os.environ.get(
+                "GALAXEA_UPRIGHT_BOTTLES_LEROBOT_ROOT",
+                "/home/vipuser/robotics/GalaxeaManipSim/datasets/galaxea_r1_upright_bottles_v1/lerobot",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        policy_metadata=GALAXEA_POLICY_METADATA,
+    ),
+    # 低显存 upright bottles LoRA 微调配置。它必须使用同一 action horizon
+    # 计算出的 stats，否则训练与推理的归一化分布不一致。
+    # Low-memory Pi05 LoRA fine-tuning for the upright bottle task.  Its
+    # normalization stats must be computed with action_horizon=15 before a
+    # new checkpoint is trained.
+    TrainConfig(
+        name="pi05_galaxea_r1_upright_bottles_v1_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_policy.GALAXEA_MODEL_ACTION_DIM,
+            action_horizon=galaxea_policy.GALAXEA_ACTION_HORIZON,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotGalaxeaDataConfig(
+            repo_id="galaxea_r1_upright_bottles_v1",
+            assets=AssetsConfig(
+                assets_dir="/home/vipuser/robotics/openpi/assets/pi05_galaxea_r1_upright_bottles_v1"
+            ),
+            dataset_root=os.environ.get(
+                "GALAXEA_UPRIGHT_BOTTLES_LEROBOT_ROOT",
+                "/home/vipuser/robotics/GalaxeaManipSim/datasets/galaxea_r1_upright_bottles_v1/lerobot",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get(
+                "OPENPI_PI05_BASE_PARAMS",
+                "/home/vipuser/robotics/openpi-data/openpi-assets/checkpoints/pi05_base/params",
+            )
+        ),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_policy.GALAXEA_MODEL_ACTION_DIM,
+            action_horizon=galaxea_policy.GALAXEA_ACTION_HORIZON,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=8_000,
+        policy_metadata=GALAXEA_POLICY_METADATA,
+    ),
+    # 仅用于检查传输/形状的 smoke 配置。``ur5e_dual`` 的 stats 只是形状
+    # 兼容，不代表真实 R1 数据分布，不能用于正式训练或性能结论。
+    # Shape-compatible smoke test only.  ``ur5e_dual`` is a built-in 14-D
+    # dual-arm stats set; it is not a substitute for R1 dataset statistics.
+    TrainConfig(
+        name="pi05_galaxea_r1_smoke",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_policy.GALAXEA_MODEL_ACTION_DIM,
+            action_horizon=galaxea_policy.GALAXEA_ACTION_HORIZON,
+        ),
+        data=LeRobotGalaxeaDataConfig(
+            repo_id="R1DualBottlesPickEasy-v0",
+            assets=AssetsConfig(asset_id="ur5e_dual"),
+            default_prompt="pick up the two bottles simultaneously",
+            require_stats_metadata=False,
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        policy_metadata=GALAXEA_POLICY_METADATA,
     ),
     TrainConfig(
         name="pi0_aloha_towel",

@@ -1,0 +1,9 @@
+# 把域名替换成实际域名，并让 DNS A/AAAA 记录指向云服务器。
+# Caddy 会自动申请和续期 TLS 证书，并原生代理 WebSocket upgrade。
+pi05.example.com {
+    reverse_proxy 127.0.0.1:8000
+
+    log {
+        output file /var/log/caddy/pi05-access.log
+    }
+}

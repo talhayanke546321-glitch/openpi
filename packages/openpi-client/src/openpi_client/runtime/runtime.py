@@ -1,3 +1,11 @@
+"""OpenPI 客户端的通用 episode 调度循环。
+
+Runtime 不关心动作来自本地模型还是 WebSocket，也不关心环境是机器人
+还是 SAPIEN。它只执行统一的三步协议：读取 observation、向 Agent 请求
+action、把 action 应用到 Environment。Galaxea 的具体字段转换由环境和
+policy adapter 完成，因此这里保持通用。
+"""
+
 import logging
 import threading
 import time
@@ -8,7 +16,7 @@ from openpi_client.runtime import subscriber as _subscriber
 
 
 class Runtime:
-    """The core module orchestrating interactions between key components of the system."""
+    """按固定频率协调 Environment、Agent 和可选 Subscriber。"""
 
     def __init__(
         self,
@@ -19,6 +27,7 @@ class Runtime:
         num_episodes: int = 1,
         max_episode_steps: int = 0,
     ) -> None:
+        """保存 episode 数量、最大步数和控制频率配置。"""
         self._environment = environment
         self._agent = agent
         self._subscribers = subscribers
@@ -30,7 +39,7 @@ class Runtime:
         self._episode_steps = 0
 
     def run(self) -> None:
-        """Runs the runtime loop continuously until stop() is called or the environment is done."""
+        """连续运行指定数量的 episode，并在最后 reset 环境。"""
         for _ in range(self._num_episodes):
             self._run_episode()
 
@@ -38,17 +47,17 @@ class Runtime:
         self._environment.reset()
 
     def run_in_new_thread(self) -> threading.Thread:
-        """Runs the runtime loop in a new thread."""
+        """在后台线程中启动 ``run``，返回线程句柄。"""
         thread = threading.Thread(target=self.run)
         thread.start()
         return thread
 
     def mark_episode_complete(self) -> None:
-        """Marks the end of an episode."""
+        """让当前 episode 的 while 循环在本轮结束后退出。"""
         self._in_episode = False
 
     def _run_episode(self) -> None:
-        """Runs a single episode."""
+        """执行一个 episode 的 reset、agent reset 和按频率控制循环。"""
         logging.info("Starting episode...")
         self._environment.reset()
         self._agent.reset()
@@ -78,7 +87,7 @@ class Runtime:
             subscriber.on_episode_end()
 
     def _step(self) -> None:
-        """A single step of the runtime loop."""
+        """执行一次 ``observation -> action -> apply_action`` 闭环迭代。"""
         observation = self._environment.get_observation()
         action = self._agent.get_action(observation)
         self._environment.apply_action(action)

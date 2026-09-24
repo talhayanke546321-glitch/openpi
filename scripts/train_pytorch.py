@@ -25,6 +25,7 @@ Multi-Node Training:
 
 import dataclasses
 import gc
+import json
 import logging
 import os
 import platform
@@ -42,6 +43,7 @@ import wandb
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
+import openpi.policies.galaxea_policy as _galaxea_policy
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
@@ -180,7 +182,11 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         # save norm stats
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+            assets_path = tmp_ckpt_dir / "assets" / data_config.asset_id
+            _normalize.save(assets_path, norm_stats)
+            if data_config.norm_stats_metadata is not None:
+                metadata_path = assets_path / _galaxea_policy.NORM_STATS_METADATA_FILENAME
+                metadata_path.write_text(json.dumps(data_config.norm_stats_metadata, indent=2, sort_keys=True) + "\n")
 
         # Atomically move temp directory to final location
         if final_ckpt_dir.exists():

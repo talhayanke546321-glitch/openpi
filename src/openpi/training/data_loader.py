@@ -1,3 +1,12 @@
+"""OpenPI 数据集读取和 transform pipeline 组装。
+
+Galaxea 的 LeRobot 数据在磁盘上按组件字段保存；本文件负责读取数据集、
+验证 metadata、按 action horizon 取出未来动作序列，并以固定顺序执行：
+字段重排 -> Galaxea 语义转换 -> normalization -> 模型 transform。
+在线推理由 ``policy_config.py`` 组装同一套 transform，因此训练和推理
+看到的输入/输出契约保持一致。
+"""
+
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
@@ -12,6 +21,8 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.policies.galaxea_policy as _galaxea_policy
+import openpi.policies.galaxea_r1_pro_policy as _galaxea_r1_pro_policy
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
@@ -20,7 +31,7 @@ T_co = TypeVar("T_co", covariant=True)
 
 
 class Dataset(Protocol[T_co]):
-    """Interface for a dataset with random access."""
+    """支持按索引读取的随机访问数据集接口。"""
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         raise NotImplementedError("Subclasses of Dataset should implement __getitem__.")
@@ -30,7 +41,7 @@ class Dataset(Protocol[T_co]):
 
 
 class IterableDataset(Protocol[T_co]):
-    """Interface for an iterable dataset."""
+    """支持流式迭代的数据集接口。"""
 
     def __iter__(self) -> Iterator[T_co]:
         raise NotImplementedError("Subclasses of IterableDataset should implement __iter__.")
@@ -40,7 +51,7 @@ class IterableDataset(Protocol[T_co]):
 
 
 class DataLoader(Protocol[T_co]):
-    """Interface for a data loader."""
+    """训练循环使用的数据加载器接口。"""
 
     def data_config(self) -> _config.DataConfig:
         """Get the data config for this data loader."""
@@ -51,6 +62,8 @@ class DataLoader(Protocol[T_co]):
 
 
 class TransformedDataset(Dataset[T_co]):
+    """对随机访问数据集按样本应用一组输入 transform。"""
+
     def __init__(self, dataset: Dataset, transforms: Sequence[_transforms.DataTransformFn]):
         self._dataset = dataset
         self._transform = _transforms.compose(transforms)
@@ -63,6 +76,8 @@ class TransformedDataset(Dataset[T_co]):
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
+    """对可迭代数据集逐样本或逐 batch 应用 transform。"""
+
     def __init__(
         self,
         dataset: IterableDataset,
@@ -77,17 +92,17 @@ class IterableTransformedDataset(IterableDataset[T_co]):
     def __iter__(self):
         for sample in self._dataset:
             if self._is_batched:
-                # Transforms are designed to be applied to individual samples. So we need to split the batch into
-                # individual samples and apply the transform to each sample individually.
+                # transform 的定义针对单样本，因此先拆 batch、逐样本处理，
+                # 最后再沿 batch 维度重新堆叠。
                 batch_size = next(v.shape[0] for v in sample.values())
 
-                # Split batch into individual samples using tree_map
+                # 使用 tree_map 保持图片、状态、动作等嵌套结构同步拆分。
                 individual_samples = [jax.tree.map(lambda x: x[i], sample) for i in range(batch_size)]  # noqa: B023
 
-                # Transform each sample
+                # 每个样本都会经过同一套 Galaxea/模型 transform。
                 transformed = [self._transform(s) for s in individual_samples]
 
-                # Recombine batch with tree_map
+                # 重新组合成模型训练使用的 batch 结构。
                 yield jax.tree.map(lambda *x: np.stack(x, axis=0), *transformed)
             else:
                 yield self._transform(sample)
@@ -130,16 +145,29 @@ class FakeDataset(Dataset):
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
-    """Create a dataset for training."""
+    """创建 PyTorch/LeRobot 随机访问数据集。
+
+    对 Galaxea 数据额外做两件事：验证 ``meta/info.json`` 的来源契约，
+    并按照 action horizon 为每个动作字段构造未来时间戳序列。若启用
+    ``prompt_from_task``，LeRobot 的 task 字段会被转成模型 prompt。
+    """
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)
+    if data_config.require_dataset_metadata:
+        if data_config.dataset_metadata is None:
+            raise ValueError("Dataset metadata contract is required but not configured")
+        if data_config.dataset_metadata.get("galaxea_robot") == "r1_pro":
+            _galaxea_r1_pro_policy.validate_dataset_metadata(dataset_meta.info, data_config.dataset_metadata)
+        else:
+            _galaxea_policy.validate_dataset_metadata(dataset_meta.info, data_config.dataset_metadata)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=data_config.dataset_root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -158,6 +186,7 @@ def create_rlds_dataset(
     *,
     shuffle: bool = False,
 ) -> Dataset:
+    """创建 RLDS 数据集；当前 OpenPI 只把它用于 DROID。"""
     # At the moment, we only support DROID for RLDS datasets.
     return DroidRldsDataset(
         data_dir=data_config.rlds_data_dir,
@@ -170,13 +199,23 @@ def create_rlds_dataset(
 
 
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
-    """Transform the dataset by applying the data transforms."""
+    """为随机访问数据集组装完整训练输入 pipeline。
+
+    只有在数据契约和 normalization stats 都存在时，正式 Galaxea 数据才
+    能进入模型；``skip_norm_stats`` 仅用于调试或统计量计算等特殊流程。
+    """
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
+            )
+        if data_config.require_norm_stats_metadata and not data_config.norm_stats_metadata_present:
+            raise ValueError(
+                "Normalization-stat metadata not found. "
+                "The stats were not generated with the current data/action contract; "
+                "run `scripts/compute_norm_stats.py --config-name=<your-config>` first."
             )
         norm_stats = data_config.norm_stats
 
@@ -198,13 +237,19 @@ def transform_iterable_dataset(
     skip_norm_stats: bool = False,
     is_batched: bool = False,
 ) -> IterableDataset:
-    """Transform the dataset by applying the data transforms."""
+    """为流式数据集组装与随机访问路径一致的 transform pipeline。"""
     norm_stats = {}
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
+            )
+        if data_config.require_norm_stats_metadata and not data_config.norm_stats_metadata_present:
+            raise ValueError(
+                "Normalization-stat metadata not found. "
+                "The stats were not generated with the current data/action contract; "
+                "run `scripts/compute_norm_stats.py --config-name=<your-config>` first."
             )
         norm_stats = data_config.norm_stats
 
@@ -229,7 +274,9 @@ def create_data_loader(
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    """Create a data loader for training.
+    """创建训练用 data loader，并选择 JAX 或 PyTorch 批处理框架。
+
+    Create a data loader for training.
 
     Args:
         config: The training configuration.

@@ -1,3 +1,15 @@
+"""PI0/PI05 的核心模型实现。
+
+这一层是 OpenPI 的“模型内部”。上层 `galaxea_policy.py` 负责把 Galaxea 的
+图像、关节状态和任务描述整理成这里要求的 Observation；推理结束后，模型返回
+一段动作序列，再由上层适配回仿真控制器使用的关节动作。
+
+模型输入主要由图像 token、语言 token、状态和动作组成。训练时使用 flow
+matching 学习从噪声动作到真实动作的速度场；在线推理时从随机噪声开始，沿反向
+时间方向积分得到动作 chunk。`action_horizon` 是模型一次预测的步数，不等于
+仿真每次实际执行的步数，后者由 action chunk broker 的执行窗口决定。
+"""
+
 import logging
 
 import einops
@@ -17,7 +29,13 @@ logger = logging.getLogger("openpi")
 
 
 def make_attn_mask(input_mask, mask_ar):
-    """Adapted from big_vision.
+    """根据 token 分段规则生成注意力 mask。
+
+    `mask_ar` 描述 token 之间的因果分段关系，`input_mask` 屏蔽 padding。图像
+    和语言通常构成可互相注意的 prefix，动作 token 位于 suffix；这个 mask 决定
+    生成动作时哪些图像、语言、状态和前序动作 token 可以被看见。
+
+    以下保留官方实现中的示例说明，便于对照原始模型代码：
 
     Tokens can attend to valid inputs tokens which have a cumulative mask_ar
     smaller or equal to theirs. This way `mask_ar` bool[?B, N] can be used to
@@ -48,7 +66,7 @@ def make_attn_mask(input_mask, mask_ar):
 def posemb_sincos(
     pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
 ) -> at.Float[at.Array, "b {embedding_dim}"]:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """把标量时间步编码成正弦/余弦向量，供动作专家感知 diffusion 时间。"""
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
 
@@ -64,7 +82,16 @@ def posemb_sincos(
 
 
 class Pi0(_model.BaseModel):
+    """PI0/PI05 的视觉语言动作模型。
+
+    初始化会组装 SigLIP 图像编码器、PaliGemma 语言模型/动作专家，以及动作的
+    输入和输出投影层。`compute_loss` 只用于训练；在线闭环调用的是
+    `sample_actions`，它会先缓存不随 diffusion 时间步变化的 prefix KV，再反复
+    更新动作序列，避免每一步重复计算视觉和语言部分。
+    """
+
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
+        """按照 `Pi0Config` 创建视觉编码器、语言模型和动作专家。"""
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
         paligemma_config = _gemma.get_config(config.paligemma_variant)
@@ -106,6 +133,11 @@ class Pi0(_model.BaseModel):
     def embed_prefix(
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        """编码不随 diffusion 时间步变化的 prefix 输入。
+
+        prefix 主要由相机图像 token 和 tokenized prompt 组成，并返回有效位 mask
+        与注意力分段 mask，供训练或采样阶段组装完整的 attention mask。
+        """
         input_mask = []
         ar_mask = []
         tokens = []
@@ -145,6 +177,12 @@ class Pi0(_model.BaseModel):
         at.Bool[at.Array, " s"],
         at.Float[at.Array, "b emb"] | None,
     ]:
+        """编码状态、带噪动作和当前 diffusion 时间步。
+
+        PI0 会把连续状态放入 suffix；PI05 的状态输入处理路径由模型配置和上游
+        transform 决定。`noisy_actions` 是当前时间步的动作，`timestep` 通过
+        正弦/余弦编码注入动作专家。
+        """
         input_mask = []
         ar_mask = []
         tokens = []
@@ -189,6 +227,12 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        """计算 flow matching 训练损失。
+
+        先在真实动作和高斯噪声之间随机采样时间点，构造中间状态 `x_t`；模型
+        预测从 `x_t` 出发的速度 `v_t`，再与解析目标 `u_t` 做均方误差。此方法
+        不参与 WebSocket 在线服务，但决定 checkpoint 学到的动作分布。
+        """
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -222,6 +266,13 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        """从随机噪声反向积分，生成一段动作 chunk。
+
+        推理过程是：预处理 observation；初始化动作噪声；对图像/语言 prefix 做
+        一次前向并缓存 KV；在多个 diffusion 时间步中用动作专家预测速度并更新
+        动作；最后返回完整动作序列。返回序列如何切片、缓存和实际执行，由
+        action chunk broker 决定，不在模型内部完成。
+        """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.

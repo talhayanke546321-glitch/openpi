@@ -1,3 +1,11 @@
+"""OpenPI 通用 Policy 推理包装器。
+
+它把模型本身和外围数据协议解耦：调用者提供原始 observation，Policy
+按顺序执行输入 transform、batch 化、模型推理和输出 transform，最后返回
+NumPy action。Galaxea 的特殊适配通过 transform 注入，而不是修改这里的
+模型推理主循环。
+"""
+
 from collections.abc import Sequence
 import logging
 import pathlib
@@ -22,6 +30,8 @@ BasePolicy: TypeAlias = _base_policy.BasePolicy
 
 
 class Policy(BasePolicy):
+    """封装 JAX/PyTorch 模型及其输入输出 transform。"""
+
     def __init__(
         self,
         model: _model.BaseModel,
@@ -47,6 +57,9 @@ class Policy(BasePolicy):
                           Only relevant when is_pytorch=True.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
         """
+        # ``transforms`` 负责把环境/数据集格式变成 model.Observation；
+        # ``output_transforms`` 负责把模型的 canonical action 变回机器人
+        # 或仿真器动作。两者必须与训练阶段使用的顺序一致。
         self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
@@ -66,6 +79,12 @@ class Policy(BasePolicy):
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        """执行一次完整策略推理。
+
+        JAX 路径会创建 batch 并使用随机 key；PyTorch 路径会转换成 tensor
+        并移动到目标设备。无论内部框架如何，外部都得到 NumPy 数组和
+        ``policy_timing``，便于 WebSocket 传输和闭环诊断。
+        """
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -111,7 +130,7 @@ class Policy(BasePolicy):
 
 
 class PolicyRecorder(_base_policy.BasePolicy):
-    """Records the policy's behavior to disk."""
+    """记录策略输入/输出，供模型调试和线上行为复盘。"""
 
     def __init__(self, policy: _base_policy.BasePolicy, record_dir: str):
         self._policy = policy
@@ -123,6 +142,7 @@ class PolicyRecorder(_base_policy.BasePolicy):
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
+        """先调用真实策略，再把本次输入输出保存为一个 step 文件。"""
         results = self._policy.infer(obs)
 
         data = {"inputs": obs, "outputs": results}

@@ -1,0 +1,31 @@
+[Unit]
+Description=Galaxea R1 OpenPI pi0.5 policy server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vipuser
+WorkingDirectory=/home/vipuser/robotics/openpi
+EnvironmentFile=/etc/openpi/galaxea-r1.env
+Environment=OPENPI_DATA_HOME=/home/vipuser/robotics/openpi-data
+Environment=XLA_PYTHON_CLIENT_PREALLOCATE=false
+Environment=XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
+ExecStart=/home/vipuser/.local/bin/uv run scripts/serve_galaxea_r1_cloud.py --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=900
+KillSignal=SIGINT
+
+# 基础 systemd 加固。GPU/JAX 需要访问设备、缓存和 checkpoint，因此不使用
+# ProtectSystem=strict；如部署目录调整，应再按实际路径收紧权限。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=full
+ReadWritePaths=-/home/vipuser/.cache
+ReadWritePaths=-/home/vipuser/robotics/openpi-data
+ReadWritePaths=-/home/vipuser/robotics/openpi/policy_records
+
+[Install]
+WantedBy=multi-user.target
