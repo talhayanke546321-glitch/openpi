@@ -24,8 +24,16 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     See WebsocketPolicyServer for a corresponding server implementation.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: Optional[int] = None, api_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: Optional[int] = None,
+        api_key: Optional[str] = None,
+        response_timeout: Optional[float] = None,
+    ) -> None:
         """拼接服务 URI、创建编码器并等待策略服务上线。"""
+        if response_timeout is not None and response_timeout <= 0:
+            raise ValueError("response_timeout must be positive or None")
         if host.startswith("ws"):
             self._uri = host
         else:
@@ -34,6 +42,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             self._uri += f":{port}"
         self._packer = msgpack_numpy.Packer()
         self._api_key = api_key
+        self._response_timeout = response_timeout
         self._ws, self._server_metadata = self._wait_for_server()
 
     def get_server_metadata(self) -> Dict:
@@ -68,7 +77,7 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
         """序列化观测、发送二进制消息、等待并解码动作响应。"""
         data = self._packer.pack(obs)
         self._ws.send(data)
-        response = self._ws.recv()
+        response = self._ws.recv(timeout=self._response_timeout)
         if isinstance(response, str):
             # we're expecting bytes; if the server sends a string, it's an error.
             raise RuntimeError(f"Error in inference server:\n{response}")
