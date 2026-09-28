@@ -11,14 +11,14 @@ EnvironmentFile=/etc/openpi/galaxea-r1.env
 Environment=OPENPI_DATA_HOME=/home/vipuser/robotics/openpi-data
 Environment=XLA_PYTHON_CLIENT_PREALLOCATE=false
 Environment=XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
-ExecStart=/home/vipuser/.local/bin/uv run scripts/serve_galaxea_r1_pro_bottle.py --host 0.0.0.0 --port 8000
+ExecStart=/home/vipuser/.local/bin/uv run scripts/serve_galaxea_r1_pro_bottle.py --host 127.0.0.1 --port 8000
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=900
 KillSignal=SIGINT
 
-# The WebSocket listener must be restricted to the R1 Pro LAN/VPN by the host
-# firewall.  Authentication remains mandatory through OPENPI_API_KEY.
+# The ROS2 client runs on this same inference workstation, so the policy server
+# stays loopback-only. Authentication remains mandatory through OPENPI_API_KEY.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only
