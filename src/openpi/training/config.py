@@ -30,6 +30,7 @@ import openpi.policies.galaxea_policy as galaxea_policy
 import openpi.policies.galaxea_r1_pro_policy as galaxea_r1_pro_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as _nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -813,6 +814,10 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
+    # Optional completed-step numbers at which to save checkpoints exactly. When
+    # non-empty, the training loop uses these values instead of save_interval and
+    # names checkpoints by the number of completed optimizer updates.
+    save_steps: tuple[int, ...] = ()
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -853,6 +858,13 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.save_steps:
+            if any(step <= 0 for step in self.save_steps):
+                raise ValueError("save_steps must contain positive completed-step numbers.")
+            if tuple(sorted(set(self.save_steps))) != self.save_steps:
+                raise ValueError("save_steps must be strictly increasing with no duplicates.")
+            if self.save_steps[-1] > self.num_train_steps:
+                raise ValueError("save_steps cannot contain a step beyond num_train_steps.")
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -926,7 +938,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader(
             os.environ.get(
                 "OPENPI_PI05_BASE_PARAMS",
-                "/home/vipuser/robotics/openpi-data/openpi-assets/checkpoints/pi05_base/params",
+                "/home/vipuser/robotics/packages/pi05_base/params",
             )
         ),
         freeze_filter=pi0_config.Pi0Config(
@@ -939,6 +951,50 @@ _CONFIGS = [
         ema_decay=None,
         batch_size=32,
         num_train_steps=30_000,
+        policy_metadata=GALAXEA_R1_PRO_POLICY_METADATA,
+    ),
+    # R1 Pro bottle pick-and-place: the original five table heights plus the
+    # supplemental 0.90 m group, with 20 successful episodes per height.  This
+    # sibling config keeps the existing dual-bottle config intact while pointing
+    # at the new task and its independent norm stats.
+    TrainConfig(
+        name="pi05_galaxea_r1_pro_bottle_place_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=galaxea_r1_pro_policy.R1_PRO_MODEL_ACTION_DIM,
+            action_horizon=galaxea_r1_pro_policy.R1_PRO_ACTION_HORIZON,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotGalaxeaR1ProDataConfig(
+            repo_id="galaxea/R1ProBottlePickPlace-v0",
+            assets=AssetsConfig(
+                assets_dir=os.environ.get(
+                    "OPENPI_R1PRO_BOTTLE_PLACE_ASSETS_DIR",
+                    "/home/vipuser/robotics/openpi/assets/pi05_galaxea_r1_pro_bottle_place",
+                )
+            ),
+            dataset_root=os.environ.get("GALAXEA_R1PRO_BOTTLE_PLACE_LEROBOT_ROOT"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            os.environ.get(
+                "OPENPI_PI05_BASE_PARAMS",
+                "/home/vipuser/robotics/packages/pi05_base/params",
+            )
+        ),
+        # Keep the 10 GB single-GPU path feasible: the standard Pi0 helper
+        # also leaves vision/action projection weights trainable when both
+        # LLM blocks use LoRA.  This task is intentionally LoRA-only; every
+        # base weight is frozen and only paths containing ``lora`` receive
+        # gradients and AdamW state.
+        freeze_filter=nnx.All(nnx.Not(_nnx_utils.PathRegex(".*lora.*"))),
+        ema_decay=None,
+        batch_size=32,
+        num_train_steps=10_000,
+        save_interval=1_000,
+        keep_period=2_000,
+        save_steps=(6_000, 8_000, 10_000),
         policy_metadata=GALAXEA_R1_PRO_POLICY_METADATA,
     ),
     # 单任务 R1 配置：适合只使用一个 Gym 任务数据集进行微调。

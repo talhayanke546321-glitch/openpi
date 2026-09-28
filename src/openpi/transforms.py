@@ -98,7 +98,15 @@ class RepackTransform(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+        repacked = jax.tree.map(lambda k: flat_item[k], self.structure)
+        # ``PromptFromLeRobotTask`` runs immediately before the repack stage
+        # for datasets that use ``prompt_from_task=True``.  Keep that metadata
+        # while selecting the model-facing fields; otherwise the later
+        # tokenizer cannot see the task prompt and fails with "Prompt is
+        # required".  Other auxiliary fields remain intentionally filtered.
+        if "prompt" in data:
+            repacked["prompt"] = data["prompt"]
+        return repacked
 
 
 @dataclasses.dataclass(frozen=True)
